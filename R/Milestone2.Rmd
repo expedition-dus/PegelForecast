@@ -1,0 +1,355 @@
+---
+title: "Rhine level prediction"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+In this notebook we present the full prediction pipeline, including data load, transformation, modelling and evaluation.
+
+This solution uses R and a couple of external packages to make the code concise.
+
+```{r message=FALSE, warning=FALSE}
+#Package Dependencies
+library(data.table) # Using it for fast and data transformation
+library(ggplot2) # To display nice plots
+library(zoo) # To manipulate time series and rolling averages
+library(GGally) # For nice scatter plots
+library(neuralnet) # For neural netwrk models
+library(rpart) # Decision tree models
+library(rpart.plot) # Tree Plot utility
+library(randomForest) # For random forest models
+#options(max.print=400)
+```
+
+# Data Load
+
+Let's see what data do we have, how many stations are available for the analysis.
+
+```{r}
+files.in.folder <- dir("data/raw", full.names = T)
+print(files.in.folder)
+```
+
+We can also check how the files are structured and how we can load them into R 
+
+```{r}
+file.type1 <- "data/raw/Düsseldorf Q15.zrx"
+file.type2 <- "data/raw/Düsseldorf W15.zrx"
+file.type3 <- "data/raw/BONN_produkt_rr_stunde_20170504_20181104_00603.txt"
+file.type4 <- "data/raw/BONN_produkt_tu_stunde_20170504_20181104_00603.txt"
+cat(paste("\n",file.type1, "\n"))
+readLines(file.type1, n = 10)
+cat(paste("\n",file.type2, "\n"))
+readLines(file.type2, n = 10)
+cat(paste("\n",file.type3, "\n"))
+readLines(file.type3, n = 10)
+cat(paste("\n",file.type4, "\n"))
+readLines(file.type4, n = 10)
+```
+
+The text files give us many hints, like the field separator (tab or semicolon), the columns available and whether the
+files have header or not
+
+```{r}
+dataset <- read.table(file.type1, sep=" ")
+head(dataset)
+dataset2 <- read.table(file.type2, sep =" ")
+head(dataset2)
+dataset3 <- read.table(file.type3, sep =";", header = T)
+head(dataset3)
+dataset4 <- read.table(file.type4, sep =";", header = T)
+head(dataset4)
+
+plot(dataset$V2, type = "p", ylab = "Level", main = "Water Level in Düsseldorf")
+
+```
+
+
+```{r}
+#Lets filter the existing files, according to their patterns
+files.temp <- grep("tu_stunde", files.in.folder, value = T)
+files.rain <- grep("rr_stunde", files.in.folder, value = T)
+files.flow <- grep("Q15", files.in.folder, value = T)
+files.level <- grep("W15", files.in.folder, value = T)
+```
+
+## Batch data load
+
+We can repeat the process for the rest files and merge all the similar data sets, if we add a "STATION" column we will be able to differentiate them.
+
+For that we first build a function that loads a list of files and then merges them into one data.frame (in this case a data.table).
+
+
+```{r}
+read.river.data <- function(filenames = NULL, separator = " ", headers = F){
+  contents <- lapply(filenames, function(datafile) {
+    dt <- read.table(datafile, header = headers, sep = separator, encoding = "UTF-8", na.strings = "NULL")
+    dt$STATION <- as.factor(toupper(strsplit(basename(datafile), split = "( |_|-)")[[1]][1]))
+    dt
+  })
+  data.table::rbindlist(contents, use.names = F)
+}
+
+```
+
+We provide different parameters since the field separators are not equal for all the file types.
+
+After reading the files we reinterpret (cast) the timestamps and fix the station names.
+
+
+```{r}
+level.data <- read.river.data(files.level)
+level.data <- level.data[, .(TIMESTAMP = strptime(format(V1, scientific = F), "%Y%m%d%H%M%S", tz = "GMT"),
+                             VALUE = V2, STATION, KPI = as.factor("LEVEL"))]
+level.data[STATION == "DÜSSELDORF", STATION := "DUESSELDORF"]
+level.data[STATION == "MANNHEIMNECKAR", STATION := "MANNHEIM"]
+level.data$STATION <- droplevels(level.data$STATION)
+
+summary(level.data)
+```
+
+```{r}
+flow.data <- read.river.data(files.flow)
+flow.data <- flow.data[, .(TIMESTAMP = strptime(format(V1, scientific = F), "%Y%m%d%H%M%S", tz = "GMT"),
+                           VALUE = V2, STATION, KPI = as.factor("FLOW"))]
+flow.data[STATION=="DÜSSELDORF", STATION := "DUESSELDORF"]
+flow.data$STATION <- droplevels(flow.data$STATION)
+summary(flow.data)
+```
+
+```{r}
+
+temp.data <- read.river.data(files.temp, separator = ";", headers = T)
+temp.data <- temp.data[, .(TIMESTAMP = strptime(format(MESS_DATUM, scientific = F), "%Y%m%d%H", tz = "GMT"),
+                           VALUE = TT_TU, STATION, KPI = as.factor("TEMPERATURE"))]
+temp.data[STATION=="DÜDO", STATION := "DUESSELDORF"]
+temp.data$STATION <- droplevels(temp.data$STATION)
+summary(temp.data)
+```
+
+```{r}
+rain.data <- read.river.data(files.rain, separator = ";", headers = T)
+rain.data <- rain.data[, .(TIMESTAMP = strptime(format(MESS_DATUM, scientific = F), "%Y%m%d%H", tz = "GMT"),
+                           VALUE = R1, STATION, KPI = "RAIN")]
+rain.data[STATION=="DÜDO", STATION := "DUESSELDORF"]
+rain.data$STATION <- droplevels(rain.data$STATION)
+summary(rain.data)
+```
+
+
+The summary for each data.frame gives us the information about data ranges, missing values and column names. Easily we can detect that some of the values are not valid. We will then proceed to clean the data.
+
+# Data cleansing and transformation
+
+Let's start correcting the level data. Here many values are under zero and other are outliers. A good option is to replace the missing values with the last one that was correct.
+
+```{r}
+level.data.clean <- rbindlist(lapply(split(level.data, by = "STATION"), function(dt){
+  dt[, VALUE := VALUE[1], .(cumsum(VALUE>=0))]
+  dt[, VALUE := VALUE[1], .(cumsum(VALUE<=1000))]
+  dt
+}))
+
+```
+
+We do something similar for the flow data
+
+```{r}
+flow.data.clean <- rbindlist(lapply(split(flow.data, by = "STATION"), function(dt){
+  dt[, VALUE := VALUE[1], .(cumsum(VALUE>=0))]
+  dt
+}))
+
+```
+
+
+For the negative rain data, we replace the negative values by zero.
+
+```{r}
+rain.data.clean <- copy(rain.data)
+rain.data.clean[VALUE<0, VALUE := 0]
+
+rain.data.acc <- rbindlist(lapply(split(rain.data.clean, by = "STATION"), function(dt){
+  dt[, ROLL_VALUE := rollmean(VALUE, 24, fill = 0)]
+  dt[, .(TIMESTAMP, VALUE = ROLL_VALUE, STATION, KPI = as.factor("RAIN24H"))]
+}))
+
+```
+
+Negative temperature is possible, but up to a limit. We correct this data too
+
+```{r}
+#Replace temperature outliers
+temp.data.clean <- rbindlist(lapply(split(temp.data, by = "STATION"), function(dt){
+  dt[, VALUE := VALUE[1], .(cumsum(VALUE>=-20))]
+}))
+
+temp.data.acc <- rbindlist(lapply(split(temp.data, by = "STATION"), function(dt){
+  dt[, VALUE := VALUE[1], .(cumsum(VALUE>=-20))]
+  dt[, ROLL_VALUE := rollmean(VALUE, 24, fill = 0)]
+  dt[, .(TIMESTAMP, VALUE = ROLL_VALUE, STATION, KPI = as.factor("TEMP24H"))]
+}))
+```
+
+
+
+
+```{r}
+mints <- max(min(rain.data.acc$TIMESTAMP),
+             min(flow.data.clean$TIMESTAMP),
+             min(rain.data.acc$TIMESTAMP),
+             min(temp.data.acc$TIMESTAMP))
+maxts <- min(max(level.data.clean$TIMESTAMP),
+             max(flow.data.clean$TIMESTAMP),
+             max(rain.data.acc$TIMESTAMP),
+             max(temp.data.acc$TIMESTAMP))
+full.data <- rbindlist(list(rain.data.acc[TIMESTAMP >= mints & TIMESTAMP <= maxts, ],
+                            temp.data.acc[TIMESTAMP >= mints & TIMESTAMP <= maxts, ],
+                            flow.data.clean[format(TIMESTAMP, "%M") == "00"
+                                            & TIMESTAMP >= mints & TIMESTAMP <= maxts, ],
+                            level.data.clean[format(TIMESTAMP, "%M") == "00"
+                                             & TIMESTAMP >= mints & TIMESTAMP <= maxts, ]),
+                       use.names = T, fill = T)
+```
+
+
+
+# Data exploration
+
+Let's see how the water level evolves in  several regions
+
+```{r}
+ggplot(data = level.data.clean[KPI == "LEVEL" 
+                        & STATION == "DUESSELDORF",],
+       aes(x=TIMESTAMP, y=VALUE)) + 
+  geom_line(aes(color=STATION), show.legend = F) +
+  labs(y = "River level [cm]",
+       x = "Day",
+       colour = "Meassuring Station",
+       title = "River Level Evolution in Düsseldorf")
+```
+
+
+```{r}
+ggplot(data = level.data.clean[KPI == "LEVEL" & 
+                                 STATION %in% c("DUESSELDORF", "BONN", "MANNHEIM", "KOBLENZ", "HEIDELBERG"), ],
+       aes(x=TIMESTAMP, y=VALUE)) + 
+  geom_line(aes(color=STATION)) +
+  labs(y = "River level [cm]",
+       x = "Day",
+       colour = "Meassuring Station",
+       title = "River Level Evolution")
+```
+
+The last plot shows certain relation between these meassuring points. What about the numeric correlation between them and the other factors?
+
+## Factor Analysis
+
+In order to analyze the different factors that affect the water level in Duesseldorf we will first
+transform the data.frame to a wide format and select some of the columns.
+
+```{r}
+
+wide.data <- dcast(full.data, TIMESTAMP ~ STATION + KPI, value.var = "VALUE", fill = 0)
+write.csv2(wide.data, file = "datawide_m1.txt", row.names = F)
+summary(wide.data)
+
+```
+
+
+### Creation a new feature variables
+
+If we want to use all the data points we can convert the daily accumulated rain data into a moving average. Then we 
+can have information for the rain in the last 24 hours.
+
+
+### Feature Analysis
+
+Let's see how the river levels are related between each other. A good option is to display a scatter plot and 
+calculate the correlations between the variables.
+
+```{r}
+GGally::ggpairs(wide.data[, .(Level_Duesseldorf = DUESSELDORF_LEVEL,
+                              Flow_Bonn = BONN_FLOW,
+                              Level_Bonn = BONN_LEVEL,
+                              Rain_Bonn = BONN_RAIN24H,
+                              Temp_Bonn = BONN_TEMP24H)],
+                title = "Correlation between Features")
+```
+
+It is also good to compare with delayed variables to confirm the hypotesis that the effects upstream affect downstream
+with certain delay.
+
+
+```{r}
+wide.temp <- copy(wide.data)
+lags <- seq(from=6, to=72, by=6)
+
+for (p_col in c("KOBLENZ_LEVEL", "BASEL_LEVEL")){
+  for (i in lags){
+    wide.temp[, paste0(p_col,i,"h") := shift(get(p_col), n=i, type = "lag")]
+  }
+}
+
+```
+
+Let's see how long does it take to reach duesseldorf from koblenz
+
+```{r message=FALSE, warning=FALSE}
+GGally::ggpairs(wide.temp[, .(Level_Duesseldorf = DUESSELDORF_LEVEL,
+                              Level_Koblenz = KOBLENZ_LEVEL,
+                              Level_Koblenz_6h = KOBLENZ_LEVEL6h,
+                              Level_Koblenz_12h = KOBLENZ_LEVEL12h,
+                              Level_Koblenz_18h = KOBLENZ_LEVEL18h)],
+                 title = "Correlations with delayed river levels")
+```
+
+
+```{r message=FALSE, warning=FALSE}
+GGally::ggpairs(wide.temp[, .(Level_Duesseldorf = DUESSELDORF_LEVEL,
+                              Level_Basel = BASEL_LEVEL,
+                              #Level_Basel_12h = BASEL_LEVEL12h,
+                              #Level_Basel_24h = BASEL_LEVEL24h,
+                              Level_Basel_48h = BASEL_LEVEL48h,
+                              Level_Basel_60h = BASEL_LEVEL60h,
+                              Level_Basel_72h = BASEL_LEVEL72h)],
+                title = "Correlation with transformed variables")
+```
+
+
+### Creation of new feature variables (2) 
+
+The goal is to forecast the river level with some time in advance, using the data as it is won't be possible. For that reason we will create auxiliary columns to show the variables with certain time delay, e.g. "basel_t-3".
+
+Our data is sampled hourly, if we want to get one day delayed info we will have to shift each observation 24 units. 
+
+```{r}
+wide.new <- copy(wide.data)
+lags <- seq(from=3, to=7, by=1)
+m_factors <- colnames(wide.new)
+m_factors <- m_factors[!m_factors %in% c("TIMESTAMP", "WESEL_LEVEL", "WESEL_RAIN24H")]
+
+for (p_col in m_factors){
+  for (i in lags){
+    wide.new[, paste0(p_col, "_", i) := shift(get(p_col), n=24*i, type = "lag")]
+  }
+}
+
+```
+
+After that we can check if the lagged variables still correlate with each other.
+
+```{r message=FALSE, warning=FALSE}
+GGally::ggpairs(wide.new[, .(Level_Duesseldorf = DUESSELDORF_LEVEL,
+                             Level_Koblenz_t3 = KOBLENZ_LEVEL_3,
+                             Level_Basel_t3 = BASEL_LEVEL_3,
+                             Rain_Basel_t3 = BASEL_RAIN24H_3,
+                             Temp_Basel_t3 = BONN_TEMP24H_3)],
+                title = "Correlation with transformed variables")
+
+
+#Saving the data
+write.csv2(model.data, file = "newfeatures_m2.txt", row.names = F)
+```
