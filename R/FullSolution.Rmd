@@ -1,0 +1,585 @@
+---
+title: "Rhine level prediction"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+In this notebook we present the full prediction pipeline, including data load, transformation, modelling and evaluation.
+
+This solution uses R and a couple of external packages to make the code concise.
+
+```{r message=FALSE, warning=FALSE}
+#Package Dependencies
+library(data.table) # Using it for fast and data transformation
+library(ggplot2) # To display nice plots
+library(zoo) # To manipulate time series and rolling averages
+library(GGally) # For nice scatter plots
+library(neuralnet) # For neural netwrk models
+library(rpart) # Decision tree models
+library(rpart.plot) # Tree Plot utility
+library(randomForest) # For random forest models
+#options(max.print=400)
+```
+
+# Data Load
+
+Let's see what data do we have, how many stations are available for the analysis.
+
+```{r}
+files.in.folder <- dir("data/raw", full.names = T)
+print(files.in.folder)
+```
+
+We can also check how the files are structured and how we can load them into R 
+
+```{r}
+file.type1 <- "data/raw/Düsseldorf Q15.zrx"
+file.type2 <- "data/raw/Düsseldorf W15.zrx"
+file.type3 <- "data/raw/BONN_produkt_rr_stunde_20170504_20181104_00603.txt"
+file.type4 <- "data/raw/BONN_produkt_tu_stunde_20170504_20181104_00603.txt"
+cat(paste("\n",file.type1, "\n"))
+readLines(file.type1, n = 10)
+cat(paste("\n",file.type2, "\n"))
+readLines(file.type2, n = 10)
+cat(paste("\n",file.type3, "\n"))
+readLines(file.type3, n = 10)
+cat(paste("\n",file.type4, "\n"))
+readLines(file.type4, n = 10)
+```
+
+The text files give us many hints, like the field separator (tab or semicolon), the columns available and whether the
+files have header or not
+
+```{r}
+dataset <- read.table(file.type1, sep=" ")
+head(dataset)
+dataset2 <- read.table(file.type2, sep =" ")
+head(dataset2)
+dataset3 <- read.table(file.type3, sep =";", header = T)
+head(dataset3)
+dataset4 <- read.table(file.type4, sep =";", header = T)
+head(dataset4)
+
+plot(dataset$V2, type = "p", ylab = "Level", main = "Water Level in Düsseldorf")
+
+```
+
+
+```{r}
+#Lets filter the existing files, according to their patterns
+files.temp <- grep("tu_stunde", files.in.folder, value = T)
+files.rain <- grep("rr_stunde", files.in.folder, value = T)
+files.flow <- grep("Q15", files.in.folder, value = T)
+files.level <- grep("W15", files.in.folder, value = T)
+```
+
+## Batch data load
+
+We can repeat the process for the rest files and merge all the similar data sets, if we add a "STATION" column we will be able to differentiate them.
+
+For that we first build a function that loads a list of files and then merges them into one data.frame (in this case a data.table).
+
+
+```{r}
+read.river.data <- function(filenames = NULL, separator = " ", headers = F){
+  contents <- lapply(filenames, function(datafile) {
+    dt <- read.table(datafile, header = headers, sep = separator, encoding = "UTF-8", na.strings = "NULL")
+    dt$STATION <- as.factor(toupper(strsplit(basename(datafile), split = "( |_|-)")[[1]][1]))
+    dt
+  })
+  data.table::rbindlist(contents, use.names = F)
+}
+
+```
+
+We provide different parameters since the field separators are not equal for all the file types.
+
+After reading the files we reinterpret (cast) the timestamps and fix the station names.
+
+
+```{r}
+level.data <- read.river.data(files.level)
+level.data <- level.data[, .(TIMESTAMP = strptime(format(V1, scientific = F), "%Y%m%d%H%M%S", tz = "GMT"),
+                             VALUE = V2, STATION, KPI = as.factor("LEVEL"))]
+level.data[STATION == "DÜSSELDORF", STATION := "DUESSELDORF"]
+level.data[STATION == "MANNHEIMNECKAR", STATION := "MANNHEIM"]
+level.data$STATION <- droplevels(level.data$STATION)
+
+summary(level.data)
+```
+
+```{r}
+flow.data <- read.river.data(files.flow)
+flow.data <- flow.data[, .(TIMESTAMP = strptime(format(V1, scientific = F), "%Y%m%d%H%M%S", tz = "GMT"),
+                           VALUE = V2, STATION, KPI = as.factor("FLOW"))]
+flow.data[STATION=="DÜSSELDORF", STATION := "DUESSELDORF"]
+flow.data$STATION <- droplevels(flow.data$STATION)
+summary(flow.data)
+```
+
+```{r}
+
+temp.data <- read.river.data(files.temp, separator = ";", headers = T)
+temp.data <- temp.data[, .(TIMESTAMP = strptime(format(MESS_DATUM, scientific = F), "%Y%m%d%H", tz = "GMT"),
+                           VALUE = TT_TU, STATION, KPI = as.factor("TEMPERATURE"))]
+temp.data[STATION=="DÜDO", STATION := "DUESSELDORF"]
+temp.data$STATION <- droplevels(temp.data$STATION)
+summary(temp.data)
+```
+
+```{r}
+rain.data <- read.river.data(files.rain, separator = ";", headers = T)
+rain.data <- rain.data[, .(TIMESTAMP = strptime(format(MESS_DATUM, scientific = F), "%Y%m%d%H", tz = "GMT"),
+                           VALUE = R1, STATION, KPI = "RAIN")]
+rain.data[STATION=="DÜDO", STATION := "DUESSELDORF"]
+rain.data$STATION <- droplevels(rain.data$STATION)
+summary(rain.data)
+```
+
+
+The summary for each data.frame gives us the information about data ranges, missing values and column names. Easily we can detect that some of the values are not valid. We will then proceed to clean the data.
+
+# Data cleansing and transformation
+
+Let's start correcting the level data. Here many values are under zero and other are outliers. A good option is to replace the missing values with the last one that was correct.
+
+```{r}
+level.data.clean <- rbindlist(lapply(split(level.data, by = "STATION"), function(dt){
+  dt[, VALUE := VALUE[1], .(cumsum(VALUE>=0))]
+  dt[, VALUE := VALUE[1], .(cumsum(VALUE<=1000))]
+  dt
+}))
+
+```
+
+We do something similar for the flow data
+
+```{r}
+flow.data.clean <- rbindlist(lapply(split(flow.data, by = "STATION"), function(dt){
+  dt[, VALUE := VALUE[1], .(cumsum(VALUE>=0))]
+  dt
+}))
+
+```
+
+
+For the negative rain data, we replace the negative values by zero.
+
+```{r}
+rain.data.clean <- copy(rain.data)
+rain.data.clean[VALUE<0, VALUE := 0]
+
+rain.data.acc <- rbindlist(lapply(split(rain.data.clean, by = "STATION"), function(dt){
+  dt[, ROLL_VALUE := rollmean(VALUE, 24, fill = 0)]
+  dt[, .(TIMESTAMP, VALUE = ROLL_VALUE, STATION, KPI = as.factor("RAIN24H"))]
+}))
+
+```
+
+Negative temperature is possible, but up to a limit. We correct this data too
+
+```{r}
+#Replace temperature outliers
+temp.data.clean <- rbindlist(lapply(split(temp.data, by = "STATION"), function(dt){
+  dt[, VALUE := VALUE[1], .(cumsum(VALUE>=-20))]
+}))
+
+temp.data.acc <- rbindlist(lapply(split(temp.data, by = "STATION"), function(dt){
+  dt[, VALUE := VALUE[1], .(cumsum(VALUE>=-20))]
+  dt[, ROLL_VALUE := rollmean(VALUE, 24, fill = 0)]
+  dt[, .(TIMESTAMP, VALUE = ROLL_VALUE, STATION, KPI = as.factor("TEMP24H"))]
+}))
+```
+
+
+
+
+```{r}
+mints <- max(min(rain.data.acc$TIMESTAMP),
+             min(flow.data.clean$TIMESTAMP),
+             min(rain.data.acc$TIMESTAMP),
+             min(temp.data.acc$TIMESTAMP))
+maxts <- min(max(level.data.clean$TIMESTAMP),
+             max(flow.data.clean$TIMESTAMP),
+             max(rain.data.acc$TIMESTAMP),
+             max(temp.data.acc$TIMESTAMP))
+full.data <- rbindlist(list(rain.data.acc[TIMESTAMP >= mints & TIMESTAMP <= maxts, ],
+                            temp.data.acc[TIMESTAMP >= mints & TIMESTAMP <= maxts, ],
+                            flow.data.clean[format(TIMESTAMP, "%M") == "00"
+                                            & TIMESTAMP >= mints & TIMESTAMP <= maxts, ],
+                            level.data.clean[format(TIMESTAMP, "%M") == "00"
+                                             & TIMESTAMP >= mints & TIMESTAMP <= maxts, ]),
+                       use.names = T, fill = T)
+```
+
+
+
+# Data exploration
+
+Let's see how the water level evolves in  several regions
+
+```{r}
+ggplot(data = level.data.clean[KPI == "LEVEL" 
+                        & STATION == "DUESSELDORF",],
+       aes(x=TIMESTAMP, y=VALUE)) + 
+  geom_line(aes(color=STATION), show.legend = F) +
+  labs(y = "River level [cm]",
+       x = "Day",
+       colour = "Meassuring Station",
+       title = "River Level Evolution in Düsseldorf")
+```
+
+
+```{r}
+ggplot(data = level.data.clean[KPI == "LEVEL" & 
+                                 STATION %in% c("DUESSELDORF", "BONN", "MANNHEIM", "KOBLENZ", "HEIDELBERG"), ],
+       aes(x=TIMESTAMP, y=VALUE)) + 
+  geom_line(aes(color=STATION)) +
+  labs(y = "River level [cm]",
+       x = "Day",
+       colour = "Meassuring Station",
+       title = "River Level Evolution")
+```
+
+The last plot shows certain relation between these meassuring points. What about the numeric correlation between them and the other factors?
+
+## Factor Analysis
+
+In order to analyze the different factors that affect the water level in Duesseldorf we will first
+transform the data.frame to a wide format and select some of the columns.
+
+```{r}
+
+wide.data <- dcast(full.data, TIMESTAMP ~ STATION + KPI, value.var = "VALUE", fill = 0)
+write.csv2(wide.data, file = "datawide_m1.txt", row.names = F)
+summary(wide.data)
+
+```
+
+
+### Creation a new feature variables
+
+If we want to use all the data points we can convert the daily accumulated rain data into a moving average. Then we 
+can have information for the rain in the last 24 hours.
+
+
+### Feature Analysis
+
+Let's see how the river levels are related between each other. A good option is to display a scatter plot and 
+calculate the correlations between the variables.
+
+```{r}
+GGally::ggpairs(wide.data[, .(Level_Duesseldorf = DUESSELDORF_LEVEL,
+                              Flow_Bonn = BONN_FLOW,
+                              Level_Bonn = BONN_LEVEL,
+                              Rain_Bonn = BONN_RAIN24H,
+                              Temp_Bonn = BONN_TEMP24H)],
+                title = "Correlation between Features")
+```
+
+It is also good to compare with delayed variables to confirm the hypotesis that the effects upstream affect downstream
+with certain delay.
+
+
+```{r}
+wide.temp <- copy(wide.data)
+lags <- seq(from=6, to=72, by=6)
+
+for (p_col in c("KOBLENZ_LEVEL", "BASEL_LEVEL")){
+  for (i in lags){
+    wide.temp[, paste0(p_col,i,"h") := shift(get(p_col), n=i, type = "lag")]
+  }
+}
+
+```
+
+Let's see how long does it take to reach duesseldorf from koblenz
+
+```{r message=FALSE, warning=FALSE}
+GGally::ggpairs(wide.temp[, .(Level_Duesseldorf = DUESSELDORF_LEVEL,
+                              Level_Koblenz = KOBLENZ_LEVEL,
+                              Level_Koblenz_6h = KOBLENZ_LEVEL6h,
+                              Level_Koblenz_12h = KOBLENZ_LEVEL12h,
+                              Level_Koblenz_18h = KOBLENZ_LEVEL18h)],
+                 title = "Correlations with delayed river levels")
+```
+
+
+```{r message=FALSE, warning=FALSE}
+GGally::ggpairs(wide.temp[, .(Level_Duesseldorf = DUESSELDORF_LEVEL,
+                              Level_Basel = BASEL_LEVEL,
+                              #Level_Basel_12h = BASEL_LEVEL12h,
+                              #Level_Basel_24h = BASEL_LEVEL24h,
+                              Level_Basel_48h = BASEL_LEVEL48h,
+                              Level_Basel_60h = BASEL_LEVEL60h,
+                              Level_Basel_72h = BASEL_LEVEL72h)],
+                title = "Correlation with transformed variables")
+```
+
+
+### Creation of new feature variables (2) 
+
+The goal is to forecast the river level with some time in advance, using the data as it is won't be possible. For that reason we will create auxiliary columns to show the variables with certain time delay, e.g. "basel_t-3".
+
+Our data is sampled hourly, if we want to get one day delayed info we will have to shift each observation 24 units. 
+
+```{r}
+wide.new <- copy(wide.data)
+lags <- seq(from=3, to=7, by=1)
+m_factors <- colnames(wide.new)
+m_factors <- m_factors[!m_factors %in% c("TIMESTAMP", "WESEL_LEVEL", "WESEL_RAIN24H")]
+
+for (p_col in m_factors){
+  for (i in lags){
+    wide.new[, paste0(p_col, "_", i) := shift(get(p_col), n=24*i, type = "lag")]
+  }
+}
+
+```
+
+After that we can check if the lagged variables still correlate with each other.
+
+```{r message=FALSE, warning=FALSE}
+GGally::ggpairs(wide.new[, .(Level_Duesseldorf = DUESSELDORF_LEVEL,
+                             Level_Koblenz_t3 = KOBLENZ_LEVEL_3,
+                             Level_Basel_t3 = BASEL_LEVEL_3,
+                             Rain_Basel_t3 = BASEL_RAIN24H_3,
+                             Temp_Basel_t3 = BONN_TEMP24H_3)],
+                title = "Correlation with transformed variables")
+
+#Saving the data
+write.csv2(wide.new, file = "newfeatures_m2.txt", row.names = F)
+```
+
+# Modeling
+
+## Linear Model
+
+In this stage we build a (simple) linear regression model based on the lagged variables. This use case can make a prediction with 3 days in advance.
+
+To model we do not take the full data set. We split the data set into a training and a test set. The last one will be used to calculate the accuracy of the model when is applied to "non-trained" data.
+
+```{r warning=FALSE}
+
+columns_to_include <- grep(".*_[3-9]$", colnames(wide.new), value=T)
+bigmodel <- paste0("DUESSELDORF_LEVEL ~ ",
+                  paste(columns_to_include, collapse = " + "))
+model.data <- wide.new[, c("TIMESTAMP", "DUESSELDORF_LEVEL", columns_to_include), with = F]
+model.data <- model.data[complete.cases(model.data), ]
+write.csv2(model.data, file = "modeldata_2_1.txt", row.names = F)
+to.exclude <- 72
+validation <- (NROW(model.data) - to.exclude + 1):NROW(model.data)
+training <- sample.int(n = NROW(model.data) - to.exclude,
+                       size = round(.7 * NROW(model.data)),
+                       replace = 0)
+testset <- setdiff(1:NROW(model.data), c(training, validation))
+linear3days <- lm(as.formula(bigmodel), data = model.data[training, ])
+summary(linear3days)
+```
+
+## Decision Trees
+
+```{r}
+tree3days <- rpart(as.formula(bigmodel), data = model.data[training, ])
+rpart.plot(tree3days, box.palette="BlGnYl", roundint = F)
+```
+
+
+## Neural Networks
+
+For neural networks we may need to reduce the amount of features and at the same time normalize the 
+variables to facilitate the convergence.
+
+In this case we will generate a neural network with a few hidden layers.
+
+```{r}
+columns_to_include_small <- grep(".*_[3-5]$", colnames(wide.new), value=T)
+small_model <- paste0("DUESSELDORF_LEVEL ~ ",
+                      paste(columns_to_include_small, collapse = " + "))
+
+scaled.model.data <- model.data[,-1][, lapply(.SD, scale)]
+mean_dus <- scaled.model.data[, attr(DUESSELDORF_LEVEL, "scaled:center")]
+sd_dus <- scaled.model.data[, attr(DUESSELDORF_LEVEL, "scaled:scale")]
+
+neural3days <- neuralnet(as.formula(small_model), data = scaled.model.data[training, ],
+                         hidden = 4, linear.output = T, threshold = .5, rep = 3)
+plot(neural3days, fontsize = 8, col.hidden = "chocolate", col.out = "darkseagreen4")
+```
+
+## Random Forests
+
+```{r}
+rf3days <- randomForest(as.formula(small_model), data = model.data[training, ], ntree = 50)
+```
+
+
+##Naive Model
+
+To benchmark our models it would be convenient to also implement a naive model that just uses the value from three days before
+
+```{r}
+# A naive model
+naivelm <- function(tdata, goal_col, input_col){
+  model <- structure(list(x = tdata[[input_col]],
+                          y = tdata[[goal_col]],
+                          fitted.values = tdata[[input_col]],
+                          input_col = input_col),
+                    class = "naivelm")
+  model
+}
+
+#The predictor
+predict.naivelm <- function(modelobj, newdata = NULL){
+  if(!is.null(newdata)){
+    newdata[[modelobj$input_col]]
+  } else {
+    modelobj$y
+  }
+}
+
+naive3days <- naivelm(model.data[training, ], "DUESSELDORF_LEVEL", "DUESSELDORF_LEVEL_3")
+```
+
+
+# Evaluation
+
+Let's see how accurate are our predictions for the water level in Duesseldorf. To do that, we apply the prediction
+models to the test set (which wasn't used for modeling).
+
+```{r}
+predictions_lm <- predict(linear3days, newdata = model.data[testset, ])
+predictions_tr <- predict(tree3days, newdata = model.data[testset, ])
+predictions_rf <- predict(rf3days, newdata = model.data[testset, ])
+predictions_nn_scaled <- compute(neural3days, scaled.model.data[testset, columns_to_include_small, with=F])
+predictions_nn <- predictions_nn_scaled$net.result * sd_dus + mean_dus
+predictions_naive <- predict(naive3days, newdata = model.data[testset, ])
+reals_test <- model.data[testset, DUESSELDORF_LEVEL]
+reals_training <- model.data[training, DUESSELDORF_LEVEL]
+
+evaluation.data <- rbindlist(list(
+  model.data[testset, .(TIMESTAMP, pegelstand = DUESSELDORF_LEVEL, label = "Real")],
+  data.table(TIMESTAMP = model.data[testset, TIMESTAMP], pegelstand = predictions_lm, label = "LM Prediction"),
+  data.table(TIMESTAMP = model.data[testset, TIMESTAMP], pegelstand = predictions_tr, label = "Tree Prediction"),
+  data.table(TIMESTAMP = model.data[testset, TIMESTAMP], pegelstand = predictions_rf, label = "RF Prediction"),
+  data.table(TIMESTAMP = model.data[testset, TIMESTAMP], pegelstand = predictions_nn, label = "NNet Prediction"),
+  data.table(TIMESTAMP = model.data[testset, TIMESTAMP], pegelstand = predictions_naive, label = "Naive Prediction")
+  ))
+
+ggplot(data=evaluation.data, aes(x=TIMESTAMP, y=pegelstand, color=label)) + 
+  geom_line() +
+  labs(y = "River level [cm]",
+       x = "Day",
+       colour = "Dataset",
+       title = "Duesseldorf River Level Evolution (test set)")
+
+```
+
+
+```{r}
+evaluation.data.err <- rbindlist(list(
+  data.table(TIMESTAMP = model.data[testset, TIMESTAMP],
+             pegelstand = (predictions_lm - reals_test), label = "LM Prediction"),
+  data.table(TIMESTAMP = model.data[testset, TIMESTAMP],
+             pegelstand = (predictions_tr - reals_test), label = "Tree Prediction"),
+  data.table(TIMESTAMP = model.data[testset, TIMESTAMP],
+             pegelstand = (predictions_rf - reals_test), label = "RF Prediction"),
+  data.table(TIMESTAMP = model.data[testset, TIMESTAMP],
+             pegelstand = (predictions_nn - reals_test), label = "NNet Prediction"),
+  data.table(TIMESTAMP = model.data[testset, TIMESTAMP],
+             pegelstand = (predictions_naive - reals_test), label = "Naive Prediction")
+  ))
+
+ggplot(data=evaluation.data.err, aes(x=TIMESTAMP, y=pegelstand, color=label)) + 
+  geom_point(alpha=.2) +
+  labs(y = "Error [cm]",
+       x = "Day",
+       colour = "Dataset",
+       title = "Prediction Error (test set)")
+```
+
+The plot above shows good results for the models, except the single decision tree. Let's calculate the error metric RMSE, 
+to get a clear picture of what model performs better.
+
+```{r}
+mse_lm <- mean((linear3days$fitted.values - reals_training)^2)
+mspe_lm <- mean((predictions_lm - reals_test)^2)
+mse_rf <- mean((predict(rf3days, newdata = model.data[training, ]) - reals_training)^2)
+mspe_rf <- mean((predictions_rf - reals_test)^2)
+mse_tr <- mean((predict(tree3days, newdata = model.data[training, ]) - reals_training)^2)
+mspe_tr <- mean((predictions_tr - reals_test)^2)
+mse_nn <- mean((neural3days$net.result[[1]] * sd_dus + mean_dus - reals_training)^2)
+mspe_nn <- mean((predictions_nn - reals_test)^2)
+mse_naive <- mean((naive3days$fitted.values - reals_training)^2)
+mspe_naive <- mean((predictions_naive - reals_test)^2)
+cat(paste0("Linear Regression\n",
+           " RMSE training set: ", sqrt(mse_lm), "\n",
+           " RMSE test set:     ", sqrt(mspe_lm), "\n",
+           "Decision Tree\n",
+           " RMSE training set: ", sqrt(mse_tr), "\n",
+           " RMSE test set:     ", sqrt(mspe_tr),"\n",
+           "Neural Network\n",
+           " RMSE training set: ", sqrt(mse_nn), "\n",
+           " RMSE test set:     ", sqrt(mspe_nn),"\n",
+           "Random Forest\n",
+           " RMSE training set: ", sqrt(mse_rf), "\n",
+           " RMSE test set:     ", sqrt(mspe_rf),"\n",
+           "Naive Model\n",
+           " RMSE training set: ", sqrt(mse_naive), "\n",
+           " RMSE test set:     ", sqrt(mspe_naive)))
+```
+
+Unfortunately the neural network didn't perform so good as we expected. This is due to the small amount of
+hidden layers and because of the reduced amount of features.
+
+```{r}
+predictions_val_lm <- predict(linear3days, newdata = model.data[validation, ])
+predictions_val_tr <- predict(tree3days, newdata = model.data[validation, ])
+predictions_val_rf <- predict(rf3days, newdata = model.data[validation, ])
+predictions_val_nn_scaled <- compute(neural3days, scaled.model.data[validation, columns_to_include_small, with=F])
+predictions_val_nn <- predictions_val_nn_scaled$net.result * sd_dus + mean_dus
+predictions_val_naive <- predict(naive3days, newdata = model.data[validation, ])
+reals_validation <- model.data[validation, DUESSELDORF_LEVEL]
+
+evaluation.data.val <- rbindlist(list(
+  data.table(TIMESTAMP = model.data[validation, TIMESTAMP],
+             pegelstand = abs(predictions_val_lm - reals_validation), label = "LM Prediction"),
+  data.table(TIMESTAMP = model.data[validation, TIMESTAMP],
+             pegelstand = abs(predictions_val_tr - reals_validation), label = "Tree Prediction"),
+  data.table(TIMESTAMP = model.data[validation, TIMESTAMP],
+             pegelstand = abs(predictions_val_rf - reals_validation), label = "RF Prediction"),
+  data.table(TIMESTAMP = model.data[validation, TIMESTAMP],
+             pegelstand = abs(predictions_val_nn - reals_validation), label = "NNet Prediction"),
+  data.table(TIMESTAMP = model.data[validation, TIMESTAMP],
+             pegelstand = abs(predictions_val_naive - reals_validation), label = "Naive Prediction")
+  ))
+
+
+ggplot(data=evaluation.data.val, aes(x=TIMESTAMP, y=pegelstand, color=label)) + 
+  geom_point(alpha=.5) +
+  labs(y = "Error [cm]",
+       x = "Day",
+       colour = "Dataset",
+       title = "Prediction Error (validation set)")
+
+```
+
+```{r}
+mspe_v_lm <- mean((predictions_val_lm - reals_validation)^2)
+mspe_v_rf <- mean((predictions_val_rf - reals_validation)^2)
+mspe_v_tr <- mean((predictions_val_tr - reals_validation)^2)
+mspe_v_nn <- mean((predictions_val_nn - reals_validation)^2)
+mspe_v_naive <- mean((predictions_val_naive - reals_validation)^2)
+
+cat(paste0("Linear Regression\n",
+           " RMSE validation set:     ", sqrt(mspe_v_lm), "\n",
+           "Decision Tree\n",
+           " RMSE validation set:     ", sqrt(mspe_v_tr),"\n",
+           "Neural Network\n",
+           " RMSE validation set:     ", sqrt(mspe_v_nn),"\n",
+           "Random Forest\n",
+           " RMSE validation set:     ", sqrt(mspe_v_rf),"\n",
+           "Naive Model\n",
+           " RMSE validation set:     ", sqrt(mspe_v_naive)))
+```
